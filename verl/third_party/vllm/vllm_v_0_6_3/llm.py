@@ -139,6 +139,11 @@ class LLM(LLM):
                 f"Unexpected tokenizer type: {type(tokenizer)}. Must be"
                 "one of the following: PreTrainedTokenizer, PreTrainedTokenizerFast, verl.workers.rollout.HybridEngineBaseTokenizer"
             )
+
+        # print('llm.py--------------------------------------------------')
+        # for name, param in model.named_parameters():
+        #     print(name)
+
         self.llm_engine = LLMEngine.from_engine_args(model, tokenizer, engine_args)  # TODO: check usagecontext
         self.request_counter = Counter()
 

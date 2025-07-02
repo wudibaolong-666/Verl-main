@@ -29,7 +29,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils import hf_tokenizer
-
+from omegaconf import ListConfig
 
 class SFTDataset(Dataset):
     """
@@ -48,16 +48,26 @@ class SFTDataset(Dataset):
         assert truncation in ['error', 'left', 'right']
         self.truncation = truncation
 
-        if not isinstance(parquet_files, List):
+        # print('---------------------------------------------------------------------------')
+        # print(parquet_files)
+        # print(type(parquet_files))
+        # print('6666666666666666666666666666666666666666666666666666666666666666666')
+        if not isinstance(parquet_files, ListConfig):
             parquet_files = [parquet_files]
+        else:
+            parquet_files = list(parquet_files)
 
         self.parquet_files = parquet_files
+        # print(self.parquet_files)
+        # print(type(self.parquet_files))
         if isinstance(tokenizer, str):
             tokenizer = hf_tokenizer(tokenizer)
         self.tokenizer: PreTrainedTokenizer = tokenizer
 
-        self.prompt_key = prompt_key if isinstance(prompt_key, (tuple, list)) else [prompt_key]
-        self.response_key = response_key if isinstance(response_key, (tuple, list)) else [response_key]
+        # self.prompt_key = prompt_key if isinstance(prompt_key, (tuple, list)) else [prompt_key]
+        # self.response_key = response_key if isinstance(response_key, (tuple, list)) else [response_key]
+        self.prompt_key = prompt_key
+        self.response_key = response_key
         self.prompt_dict_keys = [] if not prompt_dict_keys else prompt_dict_keys
         self.response_dict_keys = [] if not response_dict_keys else response_dict_keys
 

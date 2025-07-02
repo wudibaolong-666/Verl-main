@@ -78,6 +78,9 @@ class WorkerMeta:
 
 
 # we assume that in each WorkerGroup, there is a Master Worker
+'''
+    管理一个分布式工作节点的初始化、配置以及与其他节点的通信。
+'''
 class Worker(WorkerHelper):
     """A (distributed) worker."""
 

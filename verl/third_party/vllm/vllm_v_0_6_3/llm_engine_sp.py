@@ -223,6 +223,10 @@ class LLMEngine(LLMEngine):
             observability_config=self.observability_config,
         )
 
+        # print('llm_engine_sp.py--------------------------------------------------')
+        # for name, param in model.named_parameters():
+        #     print(name)
+
         if not self.model_config.embedding_mode:
             self._initialize_kv_caches()
 

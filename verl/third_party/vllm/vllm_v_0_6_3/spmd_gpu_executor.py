@@ -89,6 +89,10 @@ class SPMDGPUExecutor(ExecutorBase):
         # see https://github.com/NVIDIA/nccl/issues/1234
         os.environ["NCCL_CUMEM_ENABLE"] = "0"
 
+        # print('spmd_gpu_executor.py--------------------------------------------------')
+        # for name, param in model.named_parameters():
+        #     print(name)
+
         self.worker = Worker(
             model,
             self.model_config,

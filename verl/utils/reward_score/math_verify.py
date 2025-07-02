@@ -18,7 +18,10 @@ try:
 except ImportError:
     print("To use Math-Verify, please install it first by running `pip install math-verify`.")
 
-
+'''
+    使用 math-verify 库提供的数学验证工具进行更精确的验证，可能对数学表达式的格式、符号等有更严格的检查
+    返回一个评分，可能是一个浮动的分数值，表示模型的输出与真实答案的匹配程度
+'''
 def compute_score(model_output: str, ground_truth: str) -> bool:
     verify_func = math_metric(
         gold_extraction_target=(LatexExtractionConfig(),),

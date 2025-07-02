@@ -77,13 +77,12 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
 
     # Add lambda policy for LoRA modules if is_lora is True
     if is_lora:
-
+        #  判断给定的模块（module）是否是一个“叶子模块”（没有子模块且具有可训练权重）
         def lambda_policy_fn(module):
             if (len(list(module.named_children())) == 0 and getattr(module, "weight", None) is not None and
                     module.weight.requires_grad):
                 return True
             return False
-
         lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
         policies.append(lambda_policy)
 

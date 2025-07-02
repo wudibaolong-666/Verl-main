@@ -43,3 +43,6 @@ trainer:
   logger: ['console']
   seed: 1
 
+hydra:
+  run:
+    dir: /home/run/wh/logs/hydra/${now:%Y%m%d_%H%M%S}

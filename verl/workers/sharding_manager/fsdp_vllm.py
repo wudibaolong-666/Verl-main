@@ -84,6 +84,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
         params = self.module.state_dict()
+
+        # print("FSDP")
+        # print(params.keys())
+
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
         # Copy, not share memory
         load_format = 'hf' if self.full_params else 'dtensor'

@@ -4,3 +4,7 @@ data:
   response_key: responses
   data_source_key: data_source
   reward_model_key: reward_model
+
+hydra:
+  run:
+    dir: /home/run/wh-verl/hydra/${now:%Y%m%d_%H%M%S}

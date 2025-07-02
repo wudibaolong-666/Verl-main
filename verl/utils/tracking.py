@@ -37,8 +37,18 @@ class Tracking(object):
         self.logger = {}
 
         if 'tracking' in default_backend or 'wandb' in default_backend:
+            # import wandb
+            # wandb.init(project=project_name, name=experiment_name, config=config)
+            # self.logger['wandb'] = wandb
             import wandb
-            wandb.init(project=project_name, name=experiment_name, config=config)
+            import os
+            WANDB_API_KEY = os.environ.get("WANDB_API_KEY", None)
+            # WANDB_API_KEY = "328d157fb3d3388915a539aecd26988940c6883d"
+            if WANDB_API_KEY:
+                wandb.login(key=WANDB_API_KEY)
+            wandb.init(project=project_name, name=experiment_name, config=config,
+                       dir='/home/run/wh/logs',
+            )
             self.logger['wandb'] = wandb
 
         if 'mlflow' in default_backend:
@@ -51,11 +61,15 @@ class Tracking(object):
             import swanlab
             import os
 
-            SWANLAB_API_KEY = os.environ.get("SWANLAB_API_KEY", None)
-            SWANLAB_LOG_DIR = os.environ.get("SWANLAB_LOG_DIR", "swanlog")
+            # SWANLAB_API_KEY = os.environ.get("SWANLAB_API_KEY", None)
+            SWANLAB_API_KEY = "EToXAtdrjIz6vAeW9d9VE"
+            SWANLAB_LOG_DIR = os.environ.get("SWANLAB_LOG_DIR", "/home/run/wh/logs/swanlab")
             SWANLAB_MODE = os.environ.get("SWANLAB_MODE", "cloud")
             if SWANLAB_API_KEY:
                 swanlab.login(SWANLAB_API_KEY)  # NOTE: previous login information will be overwritten
+
+            if config is None:
+                config = {}
             swanlab.init(project=project_name,
                          experiment_name=experiment_name,
                          config={
@@ -96,6 +110,51 @@ class Tracking(object):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
+
+    def log_dict(self, config_dict: Dict, backend: Union[str, List[str]] = None):
+        """
+        记录配置字典到指定的后端
+        Args:
+            config_dict: 要记录的配置字典 (key-value pairs)
+            backend: 指定后端 (None表示所有已启用的后端)
+        """
+        if isinstance(backend, str):
+            backend = [backend]
+
+        for bk, logger in self.logger.items():
+            if backend is not None and bk not in backend:
+                continue  # 跳过未指定的后端
+
+            if bk == 'wandb':
+                # WandB: 使用config.update记录配置
+                logger.config.update(config_dict, allow_val_change=True)
+
+            elif bk == 'mlflow':
+                # MLflow: 使用log_params记录参数
+                import mlflow
+                mlflow.log_params(config_dict)
+
+            elif bk == 'swanlab':
+                # SwanLab: 通过config.update记录配置
+                if hasattr(logger, 'config'):
+                    logger.config.update(config_dict)
+
+            elif bk == 'vemlp_wandb':
+                # VEMLP WandB: 使用config.update
+                if hasattr(logger, 'config'):
+                    logger.config.update(config_dict, allow_val_change=True)
+
+            elif bk == 'tensorboard':
+                # TensorBoard: 将配置转为文本记录
+                try:
+                    config_str = json.dumps(config_dict, indent=2)
+                    logger.add_text('config', config_str, global_step=0)
+                except AttributeError:
+                    print(f"[TensorBoard] Config logging requires add_text method in adapter")
+
+            elif bk == 'console':
+                # 控制台：直接打印配置
+                print(f"[Configuration] {config_dict}")
 
     def __del__(self):
         if 'wandb' in self.logger:
@@ -166,7 +225,9 @@ def _flatten_dict(raw: Dict[str, Any], *, sep: str) -> Dict[str, Any]:
     assert isinstance(ans, dict)
     return ans
 
-
+'''
+    将生成的样本（包括输入、输出和评分）记录到两个日志系统中：WandB 和 SwanLab
+'''
 @dataclasses.dataclass
 class ValidationGenerationsLogger:
 

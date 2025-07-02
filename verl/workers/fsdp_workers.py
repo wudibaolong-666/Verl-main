@@ -40,11 +40,24 @@ from verl.utils.flops_counter import FlopsCounter
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
+
 from codetiming import Timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
+
+def print_trainable_parameters(model):
+    trainable_params = 0
+    all_params = 0
+    for _, param in model.named_parameters():
+        num_params = param.numel()
+        all_params += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+    print(f"可训练参数量: {trainable_params}")
+    print(f"总参数量: {all_params}")
+    print(f"可训练参数占比: {100 * trainable_params / all_params:.2f}%")
 
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
@@ -65,6 +78,17 @@ def get_sharding_strategy(device_mesh):
     else:
         raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
     return sharding_strategy
+
+def convert_to_regular_types(obj):
+    """Convert Hydra configs and other special types to regular Python types."""
+    from omegaconf import ListConfig, DictConfig
+    if isinstance(obj, (ListConfig, DictConfig)):
+        return {k: convert_to_regular_types(v) for k, v in obj.items()} if isinstance(obj, DictConfig) else list(obj)
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_regular_types(x) for x in obj]
+    elif isinstance(obj, dict):
+        return {k: convert_to_regular_types(v) for k, v in obj.items()}
+    return obj
 
 
 class ActorRolloutRefWorker(Worker):
@@ -153,6 +177,7 @@ class ActorRolloutRefWorker(Worker):
         from transformers import AutoModelForCausalLM, AutoConfig, AutoModelForVision2Seq
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision, CPUOffload
         from torch import optim
+        from peft import LoraConfig, TaskType, get_peft_model
 
         assert role in ['actor', 'ref']
 
@@ -167,6 +192,205 @@ class ActorRolloutRefWorker(Worker):
         torch_dtype = fsdp_config.get('model_dtype', None)
         if torch_dtype is None:
             torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+            # torch_dtype = torch.bfloat16
+        else:
+            torch_dtype = PrecisionType.to_dtype(torch_dtype)
+
+        # override model kwargs
+        actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+
+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+
+        override_config_kwargs = {
+            'bos_token_id': self.tokenizer.bos_token_id,
+            'eos_token_id': self.tokenizer.eos_token_id,
+            'pad_token_id': self.tokenizer.pad_token_id,
+        }
+        override_config_kwargs.update(override_model_config)
+        update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
+        if self.rank == 0:
+            print(f'Model config after override: {actor_model_config}')
+
+        # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
+        # 获取一个上下文管理器，用于在初始化模型权重时控制是否使用 meta tensor（延迟初始化）以及如何根据设备网格进行权重初始化
+        init_context = get_init_weight_context_manager(use_meta_tensor=not actor_model_config.tie_word_embeddings,
+                                                       mesh=self.device_mesh)
+
+        with init_context(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+                actor_module_class = AutoModelForVision2Seq
+            else:
+                actor_module_class = AutoModelForCausalLM
+
+            actor_module = actor_module_class.from_pretrained(pretrained_model_name_or_path=local_path,
+                                                              torch_dtype=torch_dtype,
+                                                              config=actor_model_config,
+                                                              attn_implementation='flash_attention_2',
+                                                              trust_remote_code=trust_remote_code)
+            # print('before------------------------------')
+            # print(actor_module)
+            if self.config.model.peft_model_id is not None:
+                from peft import PeftModel, PeftConfig
+                actor_module = PeftModel.from_pretrained(actor_module, self.config.model.peft_model_id)
+                # print('after------------------------------')
+                # print(actor_module)
+
+            if use_remove_padding or self.ulysses_sequence_parallel_size > 1:
+                from verl.models.transformers.monkey_patch import apply_monkey_patch
+                apply_monkey_patch(model=actor_module)
+
+            # Apply Liger kernel to the model if use_liger is set to True
+            if use_liger:
+                from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+                _apply_liger_kernel_to_instance(model=actor_module)
+
+            # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
+            actor_module.to(torch_dtype)
+
+            if enable_gradient_checkpointing:
+                actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+        torch.distributed.barrier()
+
+        if self.rank == 0:
+            print_model_size(actor_module)
+
+        log_gpu_memory_usage('After init from HF AutoModel', logger=logger)
+
+        if self.config.model.get('lora_rank', 0) > 0:
+            lora_config = {
+                'task_type': TaskType.CAUSAL_LM,
+                'r': self.config.model.lora_rank,
+                'lora_alpha': self.config.model.lora_alpha,
+                'target_modules': convert_to_regular_types(self.config.model.target_modules),
+                'lora_dropout': self.config.model.lora_dropout,
+                # 'target_modules': convert_to_regular_types(["q_proj", "k_proj", "v_proj", "o_proj"])
+                # 'target_modules': convert_to_regular_types([
+                # "layers.0.self_attn.q_proj",   # 第一层 self-attn 的 q_proj
+                # "layers.0.self_attn.k_proj",   # 第一层 self-attn 的 k_proj
+                # "layers.0.self_attn.v_proj",   # 第一层 self-attn 的 v_proj
+                # "layers.0.self_attn.o_proj",   # 第一层 self-attn 的 o_proj
+                # "layers.0.mlp.gate_proj",      # 第一层 mlp 的 gate_proj
+                # "layers.0.mlp.up_proj",        # 第一层 mlp 的 up_proj
+                # "layers.0.mlp.down_proj" ]),
+                'bias': "none",
+            }
+            actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+            print('----------可训练参数占比如下-------------')
+            actor_module.print_trainable_parameters()
+        else:
+            # 自定义函数查看训练参数占比
+            print('----------可训练参数占比如下-------------')
+            print_trainable_parameters(actor_module)
+
+        # We wrap FSDP for rollout as well
+        mixed_precision_config = fsdp_config.get('mixed_precision', None)
+        if mixed_precision_config is not None:
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get('param_dtype', 'bf16'))
+            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get('reduce_dtype', 'fp32'))
+            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get('buffer_dtype', 'fp32'))
+        else:
+            param_dtype = torch.bfloat16
+            reduce_dtype = torch.float32
+            buffer_dtype = torch.float32
+
+        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+
+        if self.config.model.get('lora_rank', 0) > 0:
+            is_lora = True
+        else:
+            is_lora = False
+        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get('wrap_policy', None), is_lora=is_lora)
+
+        if self._is_rollout and self.config.rollout.name == 'hf':
+            # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
+            auto_wrap_policy = None
+        print(f'---------is_lora: {is_lora}------------')
+        print(f'wrap_policy: {auto_wrap_policy}')
+
+        fsdp_mesh = self.device_mesh
+        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+
+        # TODO: add transformer policy
+        # We force reference policy to use CPUOffload to save memory.
+        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
+        cpu_offload = None if role == 'actor' else CPUOffload(offload_params=True)
+        if self.config.model.get('lora_rank', 0) > 0:
+            use_orig_params = True
+        else:
+            use_orig_params = False
+        actor_module_fsdp = FSDP(
+            actor_module,
+            cpu_offload=cpu_offload,
+            param_init_fn=init_fn,
+            use_orig_params=use_orig_params,
+            auto_wrap_policy=auto_wrap_policy,
+            device_id=torch.cuda.current_device(),
+            sharding_strategy=sharding_strategy,  # zero3
+            mixed_precision=mixed_precision,
+            sync_module_states=True,
+            device_mesh=self.device_mesh,
+            forward_prefetch=False,
+        )
+
+        log_gpu_memory_usage('After Actor FSDP init', logger=logger)
+
+        # TODO: add more optimizer args into config
+        if role == 'actor' and optim_config is not None:
+            from verl.utils.torch_functional import get_constant_schedule_with_warmup
+            actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
+                                          lr=optim_config.lr,
+                                          betas=optim_config.get('betas', (0.9, 0.999)),
+                                          weight_decay=optim_config.get('weight_decay', 1e-2))
+
+            total_steps = optim_config.get('total_training_steps', 0)
+            num_warmup_steps = int(optim_config.get('lr_warmup_steps', -1))
+            if num_warmup_steps < 0:
+                num_warmup_steps_ratio = optim_config.get('lr_warmup_steps_ratio', 0.)
+                num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+
+            print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}')
+
+            actor_lr_scheduler = get_constant_schedule_with_warmup(optimizer=actor_optimizer,
+                                                                   num_warmup_steps=num_warmup_steps)
+        else:
+            actor_optimizer = None
+            actor_lr_scheduler = None
+
+        log_gpu_memory_usage('After actor optimizer init', logger=logger)
+
+        return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
+
+    def _build_model_optimizer_ref(self,
+                               model_path,
+                               fsdp_config,
+                               optim_config,
+                               override_model_config,
+                               use_remove_padding=False,
+                               enable_gradient_checkpointing=False,
+                               trust_remote_code=False,
+                               use_liger=False,
+                               role='actor'):
+        from verl.utils.model import print_model_size, update_model_config, get_generation_config
+        from verl.utils.torch_dtypes import PrecisionType
+        from transformers import AutoModelForCausalLM, AutoConfig, AutoModelForVision2Seq
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision, CPUOffload
+        from torch import optim
+
+        assert role in ['actor', 'ref']
+
+        log_gpu_memory_usage('Before init from HF AutoModel', logger=logger)
+        local_path = copy_to_local(model_path)
+
+        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
+        # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+
+        torch_dtype = fsdp_config.get('model_dtype', None)
+        if torch_dtype is None:
+            torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+            # torch_dtype = torch.bfloat16
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
@@ -312,6 +536,7 @@ class ActorRolloutRefWorker(Worker):
             from verl.workers.sharding_manager import FSDPVLLMShardingManager
             log_gpu_memory_usage(f'Before building {rollout_name} rollout', logger=None)
             local_path = copy_to_local(self.config.model.path)
+            print(f'----------------vllm_mode: {vllm_mode}-----------------')
             if vllm_mode == 'customized':
                 rollout = vLLMRollout(actor_module=self.actor_module_fsdp,
                                       config=self.config.rollout,
@@ -328,6 +553,7 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage(f'After building {rollout_name} rollout', logger=None)
             if torch.distributed.get_world_size() == 1:
                 self.config.rollout.load_format = 'dummy_hf'
+
             rollout_sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
                                                                inference_engine=rollout.inference_engine,
                                                                model_config=self.actor_model_config,
@@ -363,6 +589,9 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        import torch
+        import torch.distributed as dist
+
         from verl.workers.actor import DataParallelPPOActor
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get('external_lib', None))
@@ -397,6 +626,7 @@ class ActorRolloutRefWorker(Worker):
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
+
         # load from checkpoint
         if self._is_actor:
             OmegaConf.set_struct(self.config.actor, True)
@@ -410,7 +640,7 @@ class ActorRolloutRefWorker(Worker):
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
 
         if self._is_ref:
-            self.ref_module_fsdp = self._build_model_optimizer(model_path=self.config.model.path,
+            self.ref_module_fsdp = self._build_model_optimizer_ref(model_path=self.config.model.path,
                                                                fsdp_config=self.config.ref.fsdp_config,
                                                                optim_config=None,
                                                                override_model_config=override_model_config,
@@ -432,6 +662,7 @@ class ActorRolloutRefWorker(Worker):
                 lr_scheduler=self.actor_lr_scheduler,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_contents=self.config.actor.checkpoint.contents)
+
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
@@ -596,6 +827,42 @@ class ActorRolloutRefWorker(Worker):
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_model(self, local_path):
+
+        assert self._is_actor
+        import torch
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        # TODO: support DCP and save sharded checkpoints
+        import torch.distributed
+        import os
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.actor.actor_module, StateDictType.FULL_STATE_DICT, cfg):
+            state_dict = self.actor.actor_module.state_dict()
+
+        if self.rank == 0:
+            if self.config.model.get('lora_rank', 0) > 0:
+                local_path = os.path.join(local_path, 'lora')
+                print(f'Saving lora model to {local_path}')
+                os.makedirs(local_path, exist_ok=True)
+                self.actor_module.save_pretrained(local_path, state_dict=state_dict)
+            else:
+                local_path = os.path.join(local_path, 'all-params')
+                os.makedirs(local_path, exist_ok=True)
+                self.actor_module.save_pretrained(local_path, state_dict=state_dict)
+                self.tokenizer.save_pretrained(local_path)
+
+        # is_lora = self.config.model.get('lora_rank', 0) > 0
+        # self.checkpoint_manager.save_model(local_path=local_path, is_lora=is_lora)
+
+        torch.distributed.barrier()
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):

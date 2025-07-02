@@ -194,6 +194,7 @@ def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
             if response_num > 1:
                 scores[i] = scores[i] * response_num / (response_num -
                                                         1) - id2mean[index[i]] * response_num / (response_num - 1)
+        # 只有最后一个 response token（即 eos token 所在位置）会获得 advantage，其余位置是 0
         scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
 
     return scores, scores
@@ -227,7 +228,7 @@ def compute_reinforce_plus_plus_outcome_advantage(token_level_rewards: torch.Ten
             # Reset after EOS
             running_return = running_return * eos_mask[:, t]
 
-        advantages = verl_F.masked_whiten(returns, eos_mask)
+        advantages = verl_F.masked_whiten(returns, eos_mask)  #  掩码下的归一化处理
         advantages = advantages * eos_mask
 
     return advantages, returns

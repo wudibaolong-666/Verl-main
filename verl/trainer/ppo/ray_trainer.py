@@ -310,6 +310,9 @@ class RayPPOTrainer(object):
         self._validate_config()
         self._create_dataloader()
 
+    '''
+        检查配置文件中的各种参数设置
+    '''
     def _validate_config(self):
         config = self.config
         # number of GPUs total
@@ -402,6 +405,9 @@ class RayPPOTrainer(object):
 
         print("[validate_config] All configuration checks passed successfully!")
 
+    '''
+        创建 RLHF 训练集和验证集
+    '''
     def _create_dataloader(self):
         # TODO: we have to make sure the batch size is divisible by the dp size
         self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
@@ -476,6 +482,10 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
+    '''
+        记录验证阶段生成的样本 到指定的日志系统
+        记录样本数 = trainer.val_generations_to_log_to_wandb
+    '''
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -500,6 +510,105 @@ class RayPPOTrainer(object):
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    '''
+        后续有需求需要修改----------max_score
+    '''
+    def _validate_new(self):
+        reward_tensor_lst = []
+        data_source_lst = []
+
+        # Lists to collect samples for the table
+        sample_inputs = []
+        sample_outputs = []
+        sample_scores = []
+
+        for test_data in self.val_dataloader:
+            test_batch = DataProto.from_single_dict(test_data)
+
+            # repeat test batch
+            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+                                           interleave=True)
+
+            # we only do validation on rule-based rm
+            if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
+                return {}
+
+            # Store original inputs
+            input_ids = test_batch.batch['input_ids']
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            sample_inputs.extend(input_texts)
+
+            if 'multi_modal_inputs' in test_batch.non_tensor_batch.keys():
+                test_gen_batch = test_batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+                )
+            else:
+                test_gen_batch = test_batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=['raw_prompt_ids'],
+                )
+
+            test_gen_batch.meta_info = {
+                'eos_token_id': self.tokenizer.eos_token_id,
+                'pad_token_id': self.tokenizer.pad_token_id,
+                'recompute_log_prob': False,
+                'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                'validate': True,
+            }
+            print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
+
+            # pad to be divisible by dp_size
+            # 使用填充后的数据批次（test_gen_batch_padded）作为输入，调用 generate_sequences() 函数生成序列
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+
+            # unpad
+            # 对填充后的生成结果进行“去填充”操作
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            print('validation generation end')
+
+            # Store generated outputs
+            output_ids = test_output_gen_batch.batch['responses']
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            sample_outputs.extend(output_texts)
+
+            test_batch = test_batch.union(test_output_gen_batch)   # 合并生成的结果
+
+            # evaluate using reward_function
+            reward_tensor = self.val_reward_fn(test_batch)  # batch * response_length
+            print(f"Shape of reward_tensor: {reward_tensor.shape}")
+
+            # Store scores
+            scores = reward_tensor.sum(-1).cpu().tolist()  #  batch
+            print(f"Shape of scores: {scores.shape}")
+            sample_scores.extend(scores)
+
+            reward_tensor_lst.append(reward_tensor)
+            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
+        data_sources = np.concatenate(data_source_lst, axis=0)
+
+        # evaluate test_score based on data source
+        data_source_reward = {}
+        for i in range(reward_tensor.shape[0]):
+            data_source = data_sources[i]
+            if data_source not in data_source_reward:
+                data_source_reward[data_source] = []
+            data_source_reward[data_source].append(reward_tensor[i].item())
+
+        metric_dict = {}
+        for data_source, rewards in data_source_reward.items():
+            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+
+        return metric_dict
+
+    '''
+        验证函数------average_score
+    '''
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
@@ -584,11 +693,25 @@ class RayPPOTrainer(object):
             data_source_reward[data_source].append(reward_tensor[i].item())
 
         metric_dict = {}
+        iter_test = self.config.actor_rollout_ref.rollout.val_kwargs.n
         for data_source, rewards in data_source_reward.items():
-            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            if "kk" in data_source:
+                count_equal_3 = sum(1 for reward in rewards if reward == 3)
+                total_count = len(rewards)
+                metric_dict[f'val/test_score/{data_source}/average@{iter_test}'] = count_equal_3 / total_count if total_count > 0 else 0
+            else:
+                metric_dict[f'val/test_score/{data_source}/average@{iter_test}'] = np.mean(rewards)
 
         return metric_dict
 
+    '''
+        1.根据配置创建并初始化不同角色（如 ActorRollout、Critic等）的工作组
+            self.resource_pool_to_cls: {'resource_pool_1': {'role_1': RoleClass1} } 
+                RoleClass1 可能是 ActorRolloutRefWorker/CriticWorkerRewardModelWorker    fsdp_workers.py
+        2.创建和管理多个 WorkerGroup，为每个角色分配计算资源，并根据配置初始化相应的模型
+            all_wg   键是工作组的名称（如 actor_rollout、critic 等），值是对应的工作组对象 (Roleclass)
+            wg_dicts 每个工作组的配置字典，字典存储了资源池和角色类的映射
+    '''
     def init_workers(self):
         """Init resource pool and worker group"""
         self.resource_pool_manager.create_resource_pool()
@@ -656,6 +779,11 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
 
+    '''
+        保存 Actor 和 Critic 模型的检查点
+        保存数据加载器的状态
+        记录最新的检查点步数
+    '''
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
@@ -702,6 +830,14 @@ class RayPPOTrainer(object):
         with open(local_latest_checkpointed_iteration, 'w') as f:
             f.write(str(self.global_steps))
 
+    def _save_model(self):
+        print(f'---------saving actor to {self.config.trainer.model_local_dir}--------------')
+        actor_local_path = os.path.join(self.config.trainer.model_local_dir, f'global_step_{self.global_steps}')
+        self.actor_rollout_wg.save_model(actor_local_path)
+
+    '''
+        加载模型检查点
+    '''
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == 'disable':
             return 0
@@ -755,6 +891,9 @@ class RayPPOTrainer(object):
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    '''
+        在分布式训练时，每个工作节点处理的样本数量（按有效 token 数量计算）大致相同
+    '''
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch['attention_mask']
@@ -781,6 +920,7 @@ class RayPPOTrainer(object):
         from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
 
+        #  使用 Tracking 类初始化 日志记录器，用于跟踪训练进度、日志和配置
         logger = Tracking(project_name=self.config.trainer.project_name,
                           experiment_name=self.config.trainer.experiment_name,
                           default_backend=self.config.trainer.logger,
@@ -793,28 +933,33 @@ class RayPPOTrainer(object):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
-            val_metrics = self._validate()
-            pprint(f'Initial validation metrics: {val_metrics}')
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get('val_only', False):
-                return
+        # if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+        #     val_metrics = self._validate()
+        #     pprint(f'Initial validation metrics: {val_metrics}')
+        #     logger.log(data=val_metrics, step=self.global_steps)
+        #     if self.config.trainer.get('val_only', False):
+        #         return
 
-        # add tqdm
+        # add tqdm  进度条
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
 
+        #  主训练循环
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                print('--------------------------------------------------------------------------------------')
+                print(batch_dict.keys())
+
 
                 # pop those keys for generation
+                # gen_batch 只保留了 batch 中 pop 的数据
                 if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
                     gen_batch = batch.pop(
                         batch_keys=['input_ids', 'attention_mask', 'position_ids'],
@@ -825,7 +970,11 @@ class RayPPOTrainer(object):
                         batch_keys=['input_ids', 'attention_mask', 'position_ids'],
                         non_tensor_batch_keys=['raw_prompt_ids'],
                     )
-
+                print('--------------------------------------------------------------------------------------')
+                print(vars(gen_batch))
+                for key in vars(batch):  # 或者 batch.__dict__
+                    print(f"Key: {key}")
+                break
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer('step', timing_raw):
@@ -852,6 +1001,7 @@ class RayPPOTrainer(object):
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
                     # repeat to align with repeated responses in rollout
+                    # batch_repeated = ['sample_1', 'sample_1', 'sample_2', 'sample_2', 'sample_3', 'sample_3']
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
@@ -938,6 +1088,10 @@ class RayPPOTrainer(object):
                             self.global_steps % self.config.trainer.save_freq == 0):
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
+                            pprint(f'Final save checkpoint: {self.config.trainer.default_local_dir}')
+
+                    if is_last_step:
+                        self._save_model()
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
@@ -956,3 +1110,4 @@ class RayPPOTrainer(object):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+            break

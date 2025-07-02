@@ -45,7 +45,7 @@ def run_generation(config) -> None:
 
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}} )
 
     ray.get(main_task.remote(config))
 
@@ -60,21 +60,25 @@ def main_task(config):
     from verl.utils import hf_tokenizer
     tokenizer = hf_tokenizer(local_path)
 
+    #  temperature=0  完全贪婪搜索（Greedy），每次都选概率最大的 token（无随机性）
     if config.rollout.temperature == 0.:
         assert config.data.n_samples == 1, 'When temperature=0, n_samples must be 1.'
 
     # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
     dataset = pd.read_parquet(config.data.path)
-    chat_lst = dataset[config.data.prompt_key].tolist()
+    chat_lst = dataset[config.data.prompt_key].tolist()  #  提取 prompt 列（chat history），变成 Python list
 
-    chat_lst = [chat.tolist() for chat in chat_lst]
+    chat_lst = [chat.tolist() for chat in chat_lst]  # turn to python list
 
-    tokenizer.padding_side = 'left'
+    tokenizer.padding_side = 'left'  #  左填充
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    #   用 Ray 启动一个远程工作类 ActorRolloutRefWorker
     ray_cls_with_init = RayClassWithInitArgs(cls=ray.remote(ActorRolloutRefWorker), config=config, role='rollout')
+    #   分配资源池
     resource_pool = RayResourcePool(process_on_nodes=[config.trainer.n_gpus_per_node] * config.trainer.nnodes)
+    #   创建一个 worker 组（RayWorkerGroup），负责统一管理你要运行的多个 Ray 模型 worker
     wg = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=ray_cls_with_init)
     wg.init_model()
 
@@ -83,7 +87,7 @@ def main_task(config):
     config_batch_size = config.data.batch_size
     dispatch_dp_size = wg.world_size
     num_batch = -(-total_samples // config_batch_size)
-    output_lst = [[] for _ in range(config.data.n_samples)]
+    output_lst = [[] for _ in range(config.data.n_samples)]  #  存储n_samples个生成的样本输出
 
     for batch_idx in range(num_batch):
         print(f'[{batch_idx+1}/{num_batch}] Start to process.')
@@ -93,15 +97,16 @@ def main_task(config):
                                                padding=True,
                                                truncation=True,
                                                max_length=config.rollout.prompt_length,
-                                               return_tensors='pt',
+                                               return_tensors='pt',  #  output torch tensor
                                                return_dict=True,
-                                               tokenize=True)
+                                               tokenize=True) # turn sentence to tokens
         input_ids = inputs['input_ids']
         attention_mask = inputs['attention_mask']
         position_ids = compute_position_id_with_mask(attention_mask)
 
         batch_dict = {'input_ids': input_ids, 'attention_mask': attention_mask, 'position_ids': position_ids}
 
+        #  原始数据 data 和虚拟数据 dummy_data 合并成一个新的 DataProto 对象，这样就能确保批次大小满足要求
         data = DataProto.from_dict(batch_dict)
         real_batch_size = data.batch['input_ids'].shape[0]
         if real_batch_size % dispatch_dp_size != 0:
@@ -135,7 +140,7 @@ def main_task(config):
 
             output_lst[i].extend(output_text_unpad)
 
-    # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
+    # convert output_lst from (n_samples, n_data) to (n_data, n_samples)
     output_lst = np.array(output_lst, dtype=object)
     output_lst = np.transpose(output_lst, axes=(1, 0)).tolist()
 

@@ -23,7 +23,7 @@ import argparse
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--local_dir', default='~/data/geo3k')
+    parser.add_argument('--local_dir', default='/home/ubuntu/verl_datasets/geo3k')
     parser.add_argument('--hdfs_dir', default=None)
 
     args = parser.parse_args()

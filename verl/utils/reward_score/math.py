@@ -13,7 +13,10 @@
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
-
+'''
+    通过手动提取框住的答案并进行字符串比较来计算分数
+    返回 1 或 0，表示是否匹配
+'''
 def compute_score(solution_str, ground_truth) -> float:
     retval = 0.
     try:

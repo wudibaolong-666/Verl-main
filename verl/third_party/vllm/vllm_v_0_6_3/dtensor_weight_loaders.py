@@ -147,7 +147,9 @@ def llama_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, local_loaded_weight)
 
-
+'''
+    将给定的 actor_weights 中的权重加载到指定的 vllm_model 中，并确保这些权重能够正确地分配到相应的模型参数
+'''
 def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn.Module:
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
@@ -158,31 +160,126 @@ def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
         ("gate_up_proj", "up_proj", 1),
     ]
     params_dict = dict(vllm_model.named_parameters(remove_duplicate=False))
-    for name, loaded_weight in actor_weights.items():
-        if "rotary_emb.inv_freq" in name:
-            continue
-        if vllm_model.config.tie_word_embeddings and "lm_head.weight" in name:
-            continue
-        for param_name, weight_name, shard_id in stacked_params_mapping:
-            if weight_name not in name:
+    # print("==> [DEBUG] params_dict keys:")
+    # for k in params_dict.keys():
+    #     print(f"origin:{k}")
+    weight_names = [name for name, weight in actor_weights.items()]
+    all_not_contains_lora = all("lora" not in item for item in weight_names) # 所有字符串都不包含 'lora'，返回 True
+    # print(weight_names)
+    # print(all_not_contains_lora)
+
+    if not all_not_contains_lora:
+        #  turn lora weight to origin weight
+        original_weights=convert_lora_weights_to_original(actor_weights)
+        import torch
+        del actor_weights  # 删除变量
+        torch.cuda.empty_cache()  # 清理未使用的显存
+        # for name, weight in actor_weights.items():
+        #     print(f"{name}  size:{weight.size()} type:{type(weight)}")
+        # for name, weight in original_weights.items():
+        #     print(f"{name}  size:{weight.size()} type:{type(weight)}")
+        for name, loaded_weight in original_weights.items():
+            if "rotary_emb.inv_freq" in name:
                 continue
-            name = name.replace(weight_name, param_name)
-            # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
+            if vllm_model.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
-            param = params_dict[name]
-            weight_loader = param.weight_loader
-            weight_loader(param, local_loaded_weight.to(dtype=param.dtype), shard_id)
-            break
-        else:
-            # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, local_loaded_weight.to(dtype=param.dtype), shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, local_loaded_weight.to(dtype=param.dtype))
+    else:
+        for name, loaded_weight in actor_weights.items():
+            if "rotary_emb.inv_freq" in name:
                 continue
-            param = params_dict[name]
-            local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, local_loaded_weight.to(dtype=param.dtype))
+            if vllm_model.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, local_loaded_weight.to(dtype=param.dtype), shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, local_loaded_weight.to(dtype=param.dtype))
+
+
+def convert_lora_weights_to_original(actor_weights):
+    """
+    Convert a LoRA-based weights dictionary to original full weights and rename keys to match the base model.
+
+    Args:
+        actor_weights (dict): Dictionary of weights with LoRA structure.
+
+    Returns:
+        dict: Dictionary with original weights and cleaned-up keys.
+    """
+    import torch
+    original_weights = {}
+
+    for key in actor_weights.keys():
+        # 只处理 base_layer.weight 或 base_layer.bias 的 key
+        if 'base_layer.weight' in key or 'base_layer.bias' in key:
+            # 构造 A 和 B 的键
+            lora_A_key = key.replace('base_layer', 'lora_A.default')
+            lora_B_key = key.replace('base_layer', 'lora_B.default')
+
+            # 提取原始值
+            base = actor_weights[key]
+            A = actor_weights.get(lora_A_key)
+            B = actor_weights.get(lora_B_key)
+
+            # 如果 A 和 B 都存在，进行合成
+            if A is not None and B is not None:
+                lora_weight = torch.matmul(B, A)
+                full_weight = base + lora_weight
+            else:
+                full_weight = base
+
+            # 重命名 key，例如：base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight
+            clean_key = key.replace('base_model.model.model.', '') \
+                           .replace('base_layer.', '')
+
+            original_weights['model.' + clean_key] = full_weight
+
+        # 处理非 LoRA 参数，直接改名
+        elif 'lora_A' not in key and 'lora_B' not in key:
+            if 'lm_head' in key:
+                clean_key = key.replace('base_model.model.', '')
+                original_weights[clean_key] = actor_weights[key]
+            else:
+                clean_key = key.replace('base_model.model.model.', '')
+                original_weights['model.' + clean_key] = actor_weights[key]
+
+    return original_weights
+
 
 
 def qwen2vl_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn.Module:

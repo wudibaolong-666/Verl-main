@@ -65,7 +65,9 @@ def sort_placement_group_by_node_ip(pgs: List[PlacementGroup]) -> List[Placement
         pg_ip[pg.id] = node_ip[node_id]
     return sorted(pgs, key=lambda pg: pg_ip[pg.id])
 
-
+'''
+    RayResourcePool 类是对 ResourcePool 的扩展，专门用于在 Ray 分布式计算框架中管理和调度资源
+'''
 class RayResourcePool(ResourcePool):
 
     def __init__(self,
@@ -144,7 +146,9 @@ def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResour
 
     return merged
 
-
+'''
+    RayClassWithInitArgs 类扩展了 ClassWithInitArgs，并专门为分布式计算（ Ray 框架）提供了额外的功能。
+'''
 class RayClassWithInitArgs(ClassWithInitArgs):
 
     def __init__(self, cls, *args, **kwargs) -> None:
@@ -193,6 +197,65 @@ class RayClassWithInitArgs(ClassWithInitArgs):
         return self.cls.options(**options).remote(*self.args, **self.kwargs)
 
 
+'''
+初始化流程：
++-------------------------+
+|  初始化 RayWorkerGroup  |
++-------------------------+
+           |
+           V
++-------------------------+
+|  判断是否为 Detached 模式 |
++-------------------------+
+           |
+           +----> 如果是 Detached --> 调用 `_init_with_detached_workers`
+           |                         |
+           |                         V
+           |                  +-----------------------------+
+           |                  |  根据 worker_names 获取 Actor |
+           |                  +-----------------------------+
+           |
+           +----> 如果不是 Detached --> 调用 `_init_with_resource_pool`
+                              |
+                              V
+                 +-----------------------------------+
+                 |  从 ResourcePool 获取 Placement  |
+                 |  Group (PG)，并根据策略分配资源 |
+                 +-----------------------------------+
+                              |
+                              V
+                 +-----------------------------------+
+                 |  启动每个 Actor，绑定环境变量和名字  |
+                 +-----------------------------------+
+                              |
+                              V
+                 +-----------------------------------+
+                 |  如果 rank=0，获取 master 地址   |
+                 +-----------------------------------+
+执行方法流程：
++---------------------------+
+|  调用 `execute_*` 方法   |
++---------------------------+
+           |
+           V
++----------------------------+
+|  判断是否为 rank 0 执行   |
++----------------------------+
+           |
+           +----> 如果是 rank 0 --> 执行方法并返回
+           |
+           +----> 如果不是 rank 0 --> 通过 remote 调用对应的 Actor 方法
+           |
+           V
++------------------------------------------+
+|  在所有 Worker 上异步执行，返回结果     |
++------------------------------------------+
+           |
+           V
++------------------------+
+|  返回所有 Worker 的结果 |
++------------------------+
+'''
 class RayWorkerGroup(WorkerGroup):
 
     def __init__(self,

@@ -129,14 +129,14 @@ class FSDPSFTTrainer(object):
                                         response_dict_keys=config.data.get('response_dict_keys', None),
                                         max_length=config.data.max_length,
                                         truncation=config.data.truncation)
-        self.val_dataset = SFTDataset(parquet_files=config.data.val_files,
-                                      tokenizer=self.tokenizer,
-                                      prompt_key=config.data.prompt_key,
-                                      prompt_dict_keys=config.data.get('prompt_dict_keys', None),
-                                      response_key=config.data.response_key,
-                                      response_dict_keys=config.data.get('response_dict_keys', None),
-                                      max_length=config.data.max_length,
-                                      truncation=config.data.truncation)
+        # self.val_dataset = SFTDataset(parquet_files=config.data.val_files,
+        #                               tokenizer=self.tokenizer,
+        #                               prompt_key=config.data.prompt_key,
+        #                               prompt_dict_keys=config.data.get('prompt_dict_keys', None),
+        #                               response_key=config.data.response_key,
+        #                               response_dict_keys=config.data.get('response_dict_keys', None),
+        #                               max_length=config.data.max_length,
+        #                               truncation=config.data.truncation)
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
@@ -166,17 +166,17 @@ class FSDPSFTTrainer(object):
                                            pin_memory=True,
                                            drop_last=True)
 
-        self.val_sampler = DistributedSampler(self.val_dataset,
-                                              shuffle=False,
-                                              num_replicas=world_size,
-                                              rank=rank,
-                                              drop_last=True)
-        self.val_dataloader = DataLoader(dataset=self.val_dataset,
-                                         batch_size=config.data.micro_batch_size_per_gpu,
-                                         sampler=self.val_sampler,
-                                         num_workers=8,
-                                         pin_memory=True,
-                                         drop_last=True)
+        # self.val_sampler = DistributedSampler(self.val_dataset,
+        #                                       shuffle=False,
+        #                                       num_replicas=world_size,
+        #                                       rank=rank,
+        #                                       drop_last=True)
+        # self.val_dataloader = DataLoader(dataset=self.val_dataset,
+        #                                  batch_size=config.data.micro_batch_size_per_gpu,
+        #                                  sampler=self.val_sampler,
+        #                                  num_workers=8,
+        #                                  pin_memory=True,
+        #                                  drop_last=True)
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):
@@ -217,17 +217,26 @@ class FSDPSFTTrainer(object):
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
                 _apply_liger_kernel_to_instance(model=self.model)
 
+            #   LoRA 配置构造
+            # print("LORA加载前")
+            # for name, param in self.model.named_parameters():
+            #     print(name)
+
             if self.config.model.get('lora_rank', 0) > 0:
-                self.model.enable_input_require_grads()
+                self.model.enable_input_require_grads()   #  前向传播的输入能够正确传播梯度到 LoRA 层
                 # Convert config to regular Python types before creating PEFT model
                 lora_config = {
-                    'task_type': TaskType.CAUSAL_LM,
-                    'r': self.config.model.lora_rank,
-                    'lora_alpha': self.config.model.lora_alpha,
-                    'target_modules': convert_to_regular_types(self.config.model.target_modules),
-                    'bias': "none"
+                    'task_type': TaskType.CAUSAL_LM,            # 指定任务类型
+                    'r': self.config.model.lora_rank,           # LoRA 的秩（rank）, 控制表达能力（越大表达能力越强）
+                    'lora_alpha': self.config.model.lora_alpha, # 缩放因子，会乘在 LoRA 输出上
+                    'target_modules': convert_to_regular_types(self.config.model.target_modules),  # 指定哪些模块注入 LoRA
+                    'bias': "none"  # 是否训练 bias 参数
                 }
-                self.model = get_peft_model(self.model, LoraConfig(**lora_config))
+                self.model = get_peft_model(self.model, LoraConfig(**lora_config))  # 将模型转换为支持 LoRA 的结构
+
+            # print("LORA加载后")
+            # for name, param in self.model.named_parameters():
+            #     print(name)
 
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
@@ -396,6 +405,15 @@ class FSDPSFTTrainer(object):
             loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
             step_loss += loss.item()
 
+            # 🔍 检查 loss 是否为 nan、inf 或不合理的数值
+            if not torch.isfinite(loss):
+                logger.error(f"❌ Loss 非法值: {loss.item()}，跳出训练。")
+                print(f"[Rank {torch.distributed.get_rank()}] Loss is not finite: {loss.item()}")
+                exit(1)
+
+            if loss.item() > 1e4:  # 可根据模型和任务调节阈值
+                logger.warning(f"⚠️ Loss 超过预期值: {loss.item()}，可能出现异常。")
+
         self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
 
         log_gpu_memory_usage('Before optimizer step', logger=logger)
@@ -422,14 +440,14 @@ class FSDPSFTTrainer(object):
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         return loss
 
-    def save_checkpoint(self, step):
+    def save_checkpoint(self, step=None, epoch=None):
         # save checkpoint
         from torch.distributed.fsdp import FullStateDictConfig, StateDictType
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
             state_dict = self.fsdp_model.state_dict()
 
-        path = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
+        path = os.path.join(self.config.trainer.default_local_dir, f'epoch_{epoch}')
         # save huggingface model
         if self.device_mesh.get_rank() == 0:
             os.makedirs(path, exist_ok=True)
@@ -448,6 +466,9 @@ class FSDPSFTTrainer(object):
             tracking = Tracking(project_name=self.config.trainer.project_name,
                                 experiment_name=self.config.trainer.experiment_name,
                                 default_backend=self.config.trainer.logger)
+            from omegaconf import OmegaConf
+            config_dict = OmegaConf.to_container(self.config, resolve=True)
+            tracking.log_dict(config_dict)
 
         global_step = 0
         # compute the total training steps.
@@ -476,35 +497,38 @@ class FSDPSFTTrainer(object):
                 # for early exit validation
                 if global_step >= self.total_training_steps:
                     # Perform final validation
-                    val_losses = []
-                    for val_data in self.val_dataloader:
-                        val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
-                    if rank == 0:
-                        avg_val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {'val/loss': avg_val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
+                    # val_losses = []
+                    # for val_data in self.val_dataloader:
+                    #     val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
+                    #     val_loss = self.validation_step(val_data)
+                    #     val_losses.append(val_loss)
+                    # if rank == 0:
+                    #     avg_val_loss = torch.mean(torch.stack(val_losses))
+                    #     metric = {'val/loss': avg_val_loss.detach().item()}
+                    #     tracking.log(data=metric, step=global_step)
                     torch.distributed.barrier()
 
                     # Save final checkpoint
-                    self.save_checkpoint(step=global_step)
+                    if self.config.trainer.default_local_dir is not None:
+                        self.save_checkpoint(epoch=epoch+1)
+                        print('save checkpoint at step %d' % global_step)
                     return
 
             # validation
-            val_losses = []
-            for data in self.val_dataloader:
-                data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                val_loss = self.validation_step(data)
-                val_losses.append(val_loss)
-            if rank == 0:
-                val_loss = torch.mean(torch.stack(val_losses))
-                metric = {'val/loss': val_loss.detach().item()}
-                tracking.log(data=metric, step=global_step)
-            torch.distributed.barrier()
+            # val_losses = []
+            # for data in self.val_dataloader:
+            #     data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
+            #     val_loss = self.validation_step(data)
+            #     val_losses.append(val_loss)
+            # if rank == 0:
+            #     val_loss = torch.mean(torch.stack(val_losses))
+            #     metric = {'val/loss': val_loss.detach().item()}
+            #     tracking.log(data=metric, step=global_step)
+            # torch.distributed.barrier()
 
-            # save checkpoint
-            self.save_checkpoint(step=global_step)
+            # save checkpoint every one episode
+            # if self.config.trainer.default_local_dir is not None:
+            #     self.save_checkpoint(epoch=epoch+1)
 
 
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer

@@ -171,3 +171,19 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         torch.distributed.barrier()
 
         self.previous_saved_paths.append(local_path)
+
+    def save_model(self,local_path,is_lora=False):
+        if local_path is None:
+            return
+
+        local_path = self.local_mkdir(local_path)
+        torch.distributed.barrier()
+
+        if self.rank == 0:
+            if is_lora:
+                self.model._fsdp_wrapped_module.config.save_pretrained(local_path)
+            else:
+                self.model._fsdp_wrapped_module.config.save_pretrained(local_path)
+                # self.processing_class.save_pretrained(local_path)
+        torch.distributed.barrier()
+

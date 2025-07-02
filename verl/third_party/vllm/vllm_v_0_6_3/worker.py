@@ -127,6 +127,9 @@ class Worker(Worker):
             prompt_adapter_config=prompt_adapter_config,
             **speculative_args,
         )
+        # print('work.py-model_runner-init------------------------------------------------')
+        # for name, param in self.model_runner.model.named_parameters():
+        #     print(name)
 
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
@@ -278,6 +281,9 @@ class Worker(Worker):
             # full model state dict without no sharding
             load_hf_weights(actor_weights, self.model_runner.model)
         elif load_format == LoadFormat.DTENSOR:
+            # print('work.py-model_runner-------------------------------------------------')
+            # for name, param in self.model_runner.model.named_parameters():
+            #     print(name)
             load_dtensor_weights(actor_weights, self.model_runner.model)
 
     def offload_model_weights(self) -> None:

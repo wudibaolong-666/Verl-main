@@ -75,6 +75,17 @@ def process_image(image: dict, max_pixels: int = 2048 * 2048, min_pixels: int = 
 class RLHFDataset(Dataset):
     """
     We assume the dataset contains a column that contains prompts and other information
+    {
+    'input_ids': [1, 2, 3],
+    'attention_mask': [1, 1, 1],
+    'position_ids': [0, 1, 2],
+    'raw_prompt_ids': [10, 11, 12],
+    'raw_prompt': "What is the capital of France?",
+    'index': 5,
+    'multi_modal_data': {'image': ['image1.jpg', 'image2.jpg']},
+    'multi_modal_inputs': {'image_tensor': torch.tensor([1.0, 2.0])},
+    'extra_info': {'question': "What is the capital of France?", 'answer': "Paris"}
+    }
     """
 
     def __init__(self,
@@ -161,7 +172,13 @@ class RLHFDataset(Dataset):
 
         chat = row_dict.pop(self.prompt_key)
 
-        prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
+        data_source = row_dict.get("data_source", "")
+        if "kk" not in data_source:
+            prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True,
+                                                           tokenize=False)
+        else:
+            prompt_with_chat_template = chat[0]['content']
+            # print(prompt_with_chat_template)
 
         is_multi_modal = self.image_key in row_dict
         if is_multi_modal:  # expand image token

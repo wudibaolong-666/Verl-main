@@ -88,21 +88,42 @@ class NaiveRewardManager:
             valid_response_ids = response_ids[:valid_response_length]
 
             # decode
-            prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
-            response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-
-            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
-
             data_source = data_item.non_tensor_batch['data_source']
+            prompt_str = []
+            response_str = []
+            sequences_str = []
+            if "kk" not in data_source:
+                prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+                response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
 
-            extra_info = data_item.non_tensor_batch.get('extra_info', None)
+                ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
-            score = self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
-            )
+                extra_info = data_item.non_tensor_batch.get('extra_info', None)
+
+                score = self.compute_score(
+                    data_source=data_source,
+                    solution_str=response_str,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
+                )
+            else:
+                sequences = torch.cat((valid_prompt_ids, valid_response_ids))
+                sequences_str = self.tokenizer.decode(sequences)
+
+                ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+
+                extra_info = data_item.non_tensor_batch.get('extra_info', None)
+
+                score = self.compute_score(
+                    data_source=data_source,
+                    solution_str=sequences_str,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
+                )
+
+            # if data_source in 'kk_logic':
+            #     score = (score + 3) / 6
+
             reward_tensor[i, valid_response_length - 1] = score
 
             if data_source not in already_print_data_sources:
@@ -110,8 +131,11 @@ class NaiveRewardManager:
 
             if already_print_data_sources[data_source] < self.num_examine:
                 already_print_data_sources[data_source] += 1
-                print("[prompt]", prompt_str)
-                print("[response]", response_str)
+                if "kk" not in data_source:
+                    print("[prompt]", prompt_str)
+                    print("[response]", response_str)
+                else:
+                    print("[sequences]", sequences_str)
                 print("[ground_truth]", ground_truth)
                 print("[score]", score)
 
