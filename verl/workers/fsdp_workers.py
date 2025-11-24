@@ -537,7 +537,7 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage(f'Before building {rollout_name} rollout', logger=None)
             local_path = copy_to_local(self.config.model.path)
             print(f'----------------vllm_mode: {vllm_mode}-----------------')
-            if vllm_mode == 'customized':
+            if vllm_mode == 'customized':    #  支持训练
                 rollout = vLLMRollout(actor_module=self.actor_module_fsdp,
                                       config=self.config.rollout,
                                       tokenizer=self.tokenizer,

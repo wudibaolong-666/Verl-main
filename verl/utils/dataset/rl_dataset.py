@@ -27,7 +27,12 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 
-
+'''
+    主要作用是 将一个批次中的数据按类型分类并转换：
+    1. 对于张量类型的数据（torch.Tensor），将其按批次堆叠成一个大的张量。
+    2. 对于非张量类型的数据，将它们转换为 NumPy 数组。
+    3. 最终返回一个 字典，它包含了所有经过处理的数据，键值对分别对应特征的名称和相应的数据。
+'''
 def collate_fn(data_list: list[dict]) -> dict:
     tensors = defaultdict(list)
     non_tensors = defaultdict(list)

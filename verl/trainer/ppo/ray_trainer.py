@@ -44,6 +44,13 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from verl.CaveEnv.env import CaveEnv
+from verl.CaveEnv.lib import *
+# from CaveEnv.prompt_guess import Prompt
+# from CaveEnv.prompt_position import Prompt
+from verl.CaveEnv.prompt_true_position import Prompt
+from verl.CaveEnv.execute import *
+
 WorkerType = Type[Worker]
 
 
@@ -308,7 +315,7 @@ class RayPPOTrainer(object):
             raise NotImplementedError
 
         self._validate_config()
-        self._create_dataloader()
+        # self._create_dataloader()
 
     '''
         检查配置文件中的各种参数设置
@@ -438,33 +445,33 @@ class RayPPOTrainer(object):
                                                    collate_fn=collate_fn,
                                                    sampler=sampler)
 
-        self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
-                                       tokenizer=self.tokenizer,
-                                       processor=self.processor,
-                                       prompt_key=self.config.data.prompt_key,
-                                       image_key=self.config.data.get('image_key', 'images'),
-                                       max_prompt_length=self.config.data.max_prompt_length,
-                                       filter_prompts=True,
-                                       return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                       truncation=self.config.data.get('truncation', 'error'),
-                                       filter_overlong_prompts=self.config.data.filter_overlong_prompts)
-        assert self.val_dataset.truncation == self.config.data.get(
-            'truncation', 'error'
-        ), f'dataset truncation {self.val_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            # Validation datasets are sent to inference engines as a whole batch,
-            # which will schedule the memory themselves.
-            batch_size=len(self.val_dataset),
-            num_workers=8,
-            shuffle=False,
-            drop_last=False,
-            collate_fn=collate_fn)
+        # self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
+        #                                tokenizer=self.tokenizer,
+        #                                processor=self.processor,
+        #                                prompt_key=self.config.data.prompt_key,
+        #                                image_key=self.config.data.get('image_key', 'images'),
+        #                                max_prompt_length=self.config.data.max_prompt_length,
+        #                                filter_prompts=True,
+        #                                return_raw_chat=self.config.data.get('return_raw_chat', False),
+        #                                truncation=self.config.data.get('truncation', 'error'),
+        #                                filter_overlong_prompts=self.config.data.filter_overlong_prompts)
+        # assert self.val_dataset.truncation == self.config.data.get(
+        #     'truncation', 'error'
+        # ), f'dataset truncation {self.val_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
+        # self.val_dataloader = StatefulDataLoader(
+        #     dataset=self.val_dataset,
+        #     # Validation datasets are sent to inference engines as a whole batch,
+        #     # which will schedule the memory themselves.
+        #     batch_size=len(self.val_dataset),
+        #     num_workers=8,
+        #     shuffle=False,
+        #     drop_last=False,
+        #     collate_fn=collate_fn)
 
         assert len(self.train_dataloader) >= 1
-        assert len(
-            self.val_dataloader
-        ) == 1, "Validation dataloader must have a single batch, which inference engines will schedule the memory themselves."
+        # assert len(
+        #     self.val_dataloader
+        # ) == 1, "Validation dataloader must have a single batch, which inference engines will schedule the memory themselves."
 
         print(f'Size of train dataloader: {len(self.train_dataloader)}')
 
@@ -920,6 +927,7 @@ class RayPPOTrainer(object):
         from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
 
+
         #  使用 Tracking 类初始化 日志记录器，用于跟踪训练进度、日志和配置
         logger = Tracking(project_name=self.config.trainer.project_name,
                           experiment_name=self.config.trainer.experiment_name,
@@ -954,9 +962,8 @@ class RayPPOTrainer(object):
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-                print('--------------------------------------------------------------------------------------')
-                print(batch_dict.keys())
-
+                print('\n' + '=' * 30 + f' Epoch {epoch} Batch Info ' + '=' * 30)
+                print("Batch dict keys:", list(batch_dict.keys()))
 
                 # pop those keys for generation
                 # gen_batch 只保留了 batch 中 pop 的数据
@@ -970,12 +977,8 @@ class RayPPOTrainer(object):
                         batch_keys=['input_ids', 'attention_mask', 'position_ids'],
                         non_tensor_batch_keys=['raw_prompt_ids'],
                     )
-                print('--------------------------------------------------------------------------------------')
-                print(vars(gen_batch))
-                for key in vars(batch):  # 或者 batch.__dict__
-                    print(f"Key: {key}")
-                break
-                is_last_step = self.global_steps >= self.total_training_steps
+
+                is_last_step: bool = self.global_steps >= self.total_training_steps
 
                 with _timer('step', timing_raw):
                     # generate a batch
